@@ -189,6 +189,8 @@ def _has_images(d):
 def find_image_dir(search_root):
     """Find the main image directory: prefer production_data/, then images/, then any dir with images.
     Supports nested structures like production_data/子文件夹/*.jpg."""
+    if _has_images(search_root):
+        return search_root
     for candidate in ["production_data", "images", "sample"]:
         d = search_root / candidate
         if d.is_dir():
