@@ -61,6 +61,19 @@ def mask_to_xywh(mask):
     return float(xs.min()), float(ys.min()), float(xs.max() - xs.min() + 1), float(ys.max() - ys.min() + 1)
 
 
+def compute_bbox_iou(box_a, box_b):
+    """Compute IoU between two xyxy boxes (x1, y1, x2, y2)."""
+    xa = max(box_a[0], box_b[0])
+    ya = max(box_a[1], box_b[1])
+    xb = min(box_a[2], box_b[2])
+    yb = min(box_a[3], box_b[3])
+    inter_area = max(0.0, xb - xa) * max(0.0, yb - ya)
+    area_a = max(0.0, box_a[2] - box_a[0]) * max(0.0, box_a[3] - box_a[1])
+    area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
+    union = area_a + area_b - inter_area
+    return inter_area / union if union > 0 else 0.0
+
+
 def save_coco_per_image(json_dir, image_info, anns, categories):
     (json_dir / f"{image_info['file_name'].rsplit('.',1)[0]}.json").write_text(
         json.dumps({"images": [image_info], "annotations": anns,
@@ -281,7 +294,7 @@ def process_dataset_task(args, model, collate, transform, postprocessor, name, c
 
         print(f"\n  [{split_name}] {len(image_paths)} images")
 
-        all_dps, all_imgs, all_qids, all_paths, all_cls = [], [], [], [], []
+        all_dps, all_imgs, all_qids, all_paths, all_cls, all_yolo_boxes = [], [], [], [], [], []
         for img_path in tqdm(image_paths, desc=f"  Loading {split_name}", unit="img"):
             try:
                 img = Image.open(img_path).convert("RGB")
@@ -305,6 +318,7 @@ def process_dataset_task(args, model, collate, transform, postprocessor, name, c
             all_qids.append(qid)
             all_paths.append(img_path)
             all_cls.append(cls_ids)
+            all_yolo_boxes.append([tuple(b) for b in boxes])
 
         if not all_dps:
             print(f"  [{split_name}] SKIP: 无有效图像")
@@ -321,6 +335,7 @@ def process_dataset_task(args, model, collate, transform, postprocessor, name, c
             batch_qids = all_qids[i:i+args.batch_size]
             batch_paths = all_paths[i:i+args.batch_size]
             batch_cls = all_cls[i:i+args.batch_size]
+            batch_yolo_boxes = all_yolo_boxes[i:i+args.batch_size]
 
             b = collate(batch_dps, dict_key="dummy")["dummy"]
             from sam3.model.utils.misc import copy_data_to_device
@@ -335,6 +350,7 @@ def process_dataset_task(args, model, collate, transform, postprocessor, name, c
                 path = Path(batch_paths[j])
                 w, h = img.size
                 img_cls_ids = batch_cls[j]
+                yolo_boxes = batch_yolo_boxes[j]
 
                 if args.skip_existing and (split_json_dir / f"{path.stem}.json").exists() and (split_mask_dir / f"{path.stem}_mask.png").exists():
                     skipped += 1
@@ -363,6 +379,11 @@ def process_dataset_task(args, model, collate, transform, postprocessor, name, c
                         continue
                     area = float(mask_bin.sum())
                     x, y, bw_b, bh_b = mask_to_xywh(mask_bin)
+                    if args.iou_threshold > 0 and yolo_boxes:
+                        mask_xyxy = (x, y, x + bw_b - 1, y + bh_b - 1)
+                        max_iou = max(compute_bbox_iou(mask_xyxy, yb) for yb in yolo_boxes)
+                        if max_iou < args.iou_threshold:
+                            continue
                     cid = img_cls_ids[k] if k < len(img_cls_ids) else 1
                     categories.setdefault(cid, f"class_{cid}")
                     anns_img.append({"id": ann_id, "image_id": img_id_counter, "category_id": cid,
@@ -440,7 +461,7 @@ def process_yolo_task(args, model, collate, transform, postprocessor, name, cfg)
         return 0, 0
     print(f"\n  {len(image_paths)} images")
 
-    all_dps, all_imgs, all_qids, all_paths = [], [], [], []
+    all_dps, all_imgs, all_qids, all_paths, all_yolo_boxes = [], [], [], [], []
     for img_path in tqdm(image_paths, desc="  Loading", unit="img"):
         try:
             img = Image.open(img_path).convert("RGB")
@@ -460,6 +481,7 @@ def process_yolo_task(args, model, collate, transform, postprocessor, name, cfg)
         all_imgs.append(img)
         all_qids.append(qid)
         all_paths.append(img_path)
+        all_yolo_boxes.append([tuple(b) for b in boxes] if boxes else [])
 
     if not all_dps:
         print("  No valid images")
@@ -474,6 +496,7 @@ def process_yolo_task(args, model, collate, transform, postprocessor, name, cfg)
         batch_imgs = all_imgs[i:i+args.batch_size]
         batch_qids = all_qids[i:i+args.batch_size]
         batch_paths = all_paths[i:i+args.batch_size]
+        batch_yolo_boxes = all_yolo_boxes[i:i+args.batch_size]
 
         b = collate(batch_dps, dict_key="dummy")["dummy"]
         from sam3.model.utils.misc import copy_data_to_device
@@ -486,6 +509,7 @@ def process_yolo_task(args, model, collate, transform, postprocessor, name, cfg)
             img, qid = batch_imgs[j], batch_qids[j]
             path = Path(batch_paths[j])
             w, h = img.size
+            yolo_boxes = batch_yolo_boxes[j]
 
             if args.skip_existing and (json_dir / f"{path.stem}.json").exists() and (mask_dir / f"{path.stem}_mask.png").exists():
                 skipped += 1
@@ -521,6 +545,11 @@ def process_yolo_task(args, model, collate, transform, postprocessor, name, cfg)
                     continue
                 area = float(mask_bin.sum())
                 x, y, bw_b, bh_b = mask_to_xywh(mask_bin)
+                if args.iou_threshold > 0 and yolo_boxes:
+                    mask_xyxy = (x, y, x + bw_b - 1, y + bh_b - 1)
+                    max_iou = max(compute_bbox_iou(mask_xyxy, yb) for yb in yolo_boxes)
+                    if max_iou < args.iou_threshold:
+                        continue
                 if boxes_np is not None and k < len(boxes_np):
                     box_xyxy = tuple(boxes_np[k].tolist())
                 else:
@@ -584,7 +613,7 @@ def process_flat_folder(args, model, collate, transform, postprocessor):
         yolo_model = YOLO(args.yolo_model)
         print(f"YOLO model loaded: {args.yolo_model}")
 
-    all_dps, all_imgs, all_qids, all_paths = [], [], [], []
+    all_dps, all_imgs, all_qids, all_paths, all_yolo_boxes = [], [], [], [], []
     for img_path in image_paths:
         try:
             img = Image.open(img_path).convert("RGB")
@@ -606,6 +635,7 @@ def process_flat_folder(args, model, collate, transform, postprocessor):
         all_imgs.append(img)
         all_qids.append(qid)
         all_paths.append(img_path)
+        all_yolo_boxes.append([tuple(b) for b in boxes] if boxes else [])
 
     if not all_dps:
         print("No valid images, exiting")
@@ -620,6 +650,7 @@ def process_flat_folder(args, model, collate, transform, postprocessor):
         batch_imgs = all_imgs[i:i+args.batch_size]
         batch_qids = all_qids[i:i+args.batch_size]
         batch_paths = all_paths[i:i+args.batch_size]
+        batch_yolo_boxes = all_yolo_boxes[i:i+args.batch_size]
 
         b = collate(batch_dps, dict_key="dummy")["dummy"]
         from sam3.model.utils.misc import copy_data_to_device
@@ -632,6 +663,7 @@ def process_flat_folder(args, model, collate, transform, postprocessor):
             img, qid = batch_imgs[j], batch_qids[j]
             path = Path(batch_paths[j])
             w, h = img.size
+            yolo_boxes = batch_yolo_boxes[j]
 
             if args.skip_existing and (json_dir / f"{path.stem}.json").exists() and (mask_dir / f"{path.stem}_mask.png").exists():
                 skipped += 1
@@ -666,6 +698,11 @@ def process_flat_folder(args, model, collate, transform, postprocessor):
                     continue
                 area = float(mask_bin.sum())
                 x, y, bw_b, bh_b = mask_to_xywh(mask_bin)
+                if args.iou_threshold > 0 and yolo_boxes:
+                    mask_xyxy = (x, y, x + bw_b - 1, y + bh_b - 1)
+                    max_iou = max(compute_bbox_iou(mask_xyxy, yb) for yb in yolo_boxes)
+                    if max_iou < args.iou_threshold:
+                        continue
                 if boxes_np is not None and k < len(boxes_np):
                     box_xyxy = tuple(boxes_np[k].tolist())
                 else:
@@ -727,6 +764,8 @@ def main():
     parser.add_argument("--morph-iterations", type=int, default=1)
     parser.add_argument("--epsilon-ratio", type=float, default=0.01)
     parser.add_argument("--alpha", type=float, default=0.5)
+    parser.add_argument("--iou-threshold", type=float, default=0.75,
+                        help="SAM3 mask 与 YOLO box 的 IoU 阈值 (0=关闭)，低于此值的 mask 将被丢弃")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--checkpoint", type=str, default="/home/model/sam3_pth/sam3pt/sam3.pt")
     args = parser.parse_args()
