@@ -218,7 +218,31 @@ def scan_material_folders(root, args):
         tasks.append((root.name, "dataset", {"root": root}))
         return tasks
 
-    # Second: check if root itself is a YOLO-mode folder (has best.pt + images)
+    # Second: check for model/ + production_data/ layout (multi-model YOLO)
+    model_dir = root / "model"
+    prod_dir = root / "production_data"
+    if model_dir.is_dir() and prod_dir.is_dir():
+        for model_sub in sorted(model_dir.iterdir()):
+            if not model_sub.is_dir():
+                continue
+            best_pt = find_best_pt(model_sub)
+            if not best_pt:
+                continue
+            prod_sub = prod_dir / model_sub.name
+            if not prod_sub.is_dir():
+                continue
+            img_dir = find_image_dir(prod_sub)
+            if not img_dir:
+                continue
+            tasks.append((model_sub.name, "yolo", {
+                "yolo_model": best_pt,
+                "image_dir": img_dir,
+                "instance_name": f"Instance_{model_sub.name}",
+            }))
+        if tasks:
+            return tasks
+
+    # Third: check if root itself is a YOLO-mode folder (has best.pt + images)
     best_pt = find_best_pt(root)
     img_dir = find_image_dir(root)
     if best_pt and img_dir:
@@ -428,6 +452,7 @@ def process_yolo_task(args, model, collate, transform, postprocessor, name, cfg)
     """Process a single YOLO-type folder (has best.pt + images) or text-only folder."""
     yolo_path = cfg["yolo_model"]
     image_dir = cfg["image_dir"]
+    instance_name = cfg.get("instance_name", "Instance")
     output_root = Path(args.output_dir) / name
 
     mode_label = "YOLO" if yolo_path else "Text-only"
@@ -447,9 +472,9 @@ def process_yolo_task(args, model, collate, transform, postprocessor, name, cfg)
         yolo_model = YOLO(str(yolo_path))
         print(f"  YOLO model loaded")
 
-    json_dir = output_root / "Instance" / "label"
-    mask_dir = output_root / "Instance" / "mask"
-    vis_dir = output_root / "Instance" / "vis"
+    json_dir = output_root / instance_name / "label"
+    mask_dir = output_root / instance_name / "mask"
+    vis_dir = output_root / instance_name / "vis"
     for d in [json_dir, mask_dir, vis_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -585,13 +610,13 @@ def process_yolo_task(args, model, collate, transform, postprocessor, name, cfg)
     if coco_images:
         cdata = {"images": coco_images, "annotations": coco_annotations,
                  "categories": [{"id": c, "name": n} for c, n in sorted(categories.items())]}
-        (output_root / "Instance" / "instances_default.json").write_text(json.dumps(cdata, indent=2), encoding="utf-8")
+        (output_root / instance_name / "instances_default.json").write_text(json.dumps(cdata, indent=2), encoding="utf-8")
         print(f"  [{name}] {processed} images, {len(coco_annotations)} annots" + (f" ({skipped} skipped)" if skipped else ""))
 
     return processed, len(coco_annotations)
 
 
-def process_flat_folder(args, model, collate, transform, postprocessor):
+def process_flat_folder(args, model, collate, transform, postprocessor, instance_name="Instance"):
     """Original flat folder / single YOLO model / text prompt mode."""
     IMAGE_EXT_LIST = list(IMAGE_EXT)
     image_paths = []
@@ -601,9 +626,9 @@ def process_flat_folder(args, model, collate, transform, postprocessor):
     print(f"Found {len(image_paths)} images")
 
     output_root = Path(args.output_dir)
-    json_dir = output_root / "Instance" / "label"
-    mask_dir = output_root / "Instance" / "mask"
-    vis_dir = output_root / "Instance" / "vis"
+    json_dir = output_root / instance_name / "label"
+    mask_dir = output_root / instance_name / "mask"
+    vis_dir = output_root / instance_name / "vis"
     for d in [json_dir, mask_dir, vis_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -736,7 +761,7 @@ def process_flat_folder(args, model, collate, transform, postprocessor):
     if coco_images:
         cdata = {"images": coco_images, "annotations": coco_annotations,
                  "categories": [{"id": c, "name": n} for c, n in sorted(categories.items())]}
-        (output_root / "Instance" / "instances_default.json").write_text(json.dumps(cdata, indent=2), encoding="utf-8")
+        (output_root / instance_name / "instances_default.json").write_text(json.dumps(cdata, indent=2), encoding="utf-8")
         print(f"\nProcessed: {processed} images, {len(coco_annotations)} annotations" + (f" ({skipped} skipped)" if skipped else ""))
 
     return processed, len(coco_annotations)
